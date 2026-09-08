@@ -11,11 +11,13 @@ from zoneinfo import ZoneInfo
 from html import escape
 
 import requests
+import psycopg2
+from psycopg2.extras import Json
 from flask import Flask, request, jsonify
 
 # =========================================================
-# SECURITY GUARD BOT v0.8
-# Пілотна версія БЕЗ PostgreSQL.
+# SECURITY GUARD BOT v0.9
+# PostgreSQL persistence через окрему guard_* таблицю.
 #
 # Нове:
 # - 15 питань
@@ -34,13 +36,14 @@ from flask import Flask, request, jsonify
 # - Мої результати: розбивка по ПІБ + рейтинг дільниць
 #
 # УВАГА:
-# Дані поки зберігаються в локальному JSON.
-# Render Free не гарантує збереження цього файлу після redeploy/restart.
+# Дані зберігаються у PostgreSQL.
+# Таблиці охоронного бота мають префікс guard_ і не перетинаються з NumizmatCoin.
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 WEBHOOK_PATH = "/telegram-webhook"
 
 PASS_PERCENT = 80
@@ -50,6 +53,8 @@ if not BOT_TOKEN:
     raise RuntimeError("Не задано BOT_TOKEN")
 if not ADMIN_ID:
     raise RuntimeError("Не задано ADMIN_ID")
+if not DATABASE_URL:
+    raise RuntimeError("Не задано DATABASE_URL")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BASE_DIR = Path(__file__).resolve().parent
@@ -2877,27 +2882,121 @@ DEFAULT_DATA = {
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def load_data():
-    if not DATA_FILE.exists():
-        data = json.loads(json.dumps(DEFAULT_DATA))
-        save_data(data)
-        return data
+STORAGE_LOCK = threading.RLock()
+GUARD_STATE_KEY = "main"
 
-    try:
-        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        for key, value in DEFAULT_DATA.items():
-            if key not in data:
-                data[key] = json.loads(json.dumps(value))
-        return data
-    except Exception:
-        log.exception("Помилка читання локального сховища")
-        return json.loads(json.dumps(DEFAULT_DATA))
+def _fresh_default_data():
+    return json.loads(json.dumps(DEFAULT_DATA, ensure_ascii=False))
+
+def db_connect():
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+def init_postgres_storage():
+    """Створює тільки таблиці охоронного бота з префіксом guard_."""
+    with STORAGE_LOCK:
+        conn = db_connect()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS guard_app_state (
+                            state_key TEXT PRIMARY KEY,
+                            payload JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS guard_schema_meta (
+                            key TEXT PRIMARY KEY,
+                            value TEXT NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO guard_schema_meta(key, value, updated_at)
+                        VALUES ('storage_version', '0.9', NOW())
+                        ON CONFLICT (key) DO UPDATE
+                        SET value = EXCLUDED.value, updated_at = NOW()
+                        """
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM guard_app_state WHERE state_key=%s",
+                        (GUARD_STATE_KEY,)
+                    )
+                    exists = cur.fetchone() is not None
+                    if not exists:
+                        seed = _fresh_default_data()
+                        # Одноразова міграція зі старого локального JSON, якщо він ще існує.
+                        if DATA_FILE.exists():
+                            try:
+                                old_data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+                                if isinstance(old_data, dict):
+                                    seed.update(old_data)
+                                    log.info("V0.9 STORAGE: imported legacy local JSON into PostgreSQL")
+                            except Exception:
+                                log.exception("V0.9 STORAGE: legacy JSON import failed; using defaults")
+                        for key, value in DEFAULT_DATA.items():
+                            if key not in seed:
+                                seed[key] = json.loads(json.dumps(value, ensure_ascii=False))
+                        cur.execute(
+                            "INSERT INTO guard_app_state(state_key, payload) VALUES (%s, %s)",
+                            (GUARD_STATE_KEY, Json(seed, dumps=lambda obj: json.dumps(obj, ensure_ascii=False)))
+                        )
+            log.info("V0.9 STORAGE: PostgreSQL ready; guard_* tables only")
+        finally:
+            conn.close()
+
+def load_data():
+    with STORAGE_LOCK:
+        try:
+            conn = db_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT payload FROM guard_app_state WHERE state_key=%s",
+                        (GUARD_STATE_KEY,)
+                    )
+                    row = cur.fetchone()
+                if not row:
+                    init_postgres_storage()
+                    return load_data()
+                data = row[0]
+                if isinstance(data, str):
+                    data = json.loads(data)
+                if not isinstance(data, dict):
+                    data = _fresh_default_data()
+                for key, value in DEFAULT_DATA.items():
+                    if key not in data:
+                        data[key] = json.loads(json.dumps(value, ensure_ascii=False))
+                return data
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("Помилка читання PostgreSQL guard_app_state")
+            return _fresh_default_data()
 
 def save_data(data):
-    DATA_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    with STORAGE_LOCK:
+        conn = db_connect()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO guard_app_state(state_key, payload, updated_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (state_key) DO UPDATE
+                        SET payload = EXCLUDED.payload, updated_at = NOW()
+                        """,
+                        (GUARD_STATE_KEY, Json(data, dumps=lambda obj: json.dumps(obj, ensure_ascii=False)))
+                    )
+        finally:
+            conn.close()
 
 def get_user(tg_id):
     return load_data()["users"].get(str(tg_id))
@@ -6496,8 +6595,9 @@ def health():
     return jsonify({
         "ok": True,
         "service": "security_guard_bot",
-        "version": "0.8",
-        "storage": "local_json_test_only",
+        "version": "0.9",
+        "storage": "postgresql_guard_app_state",
+        "database_configured": bool(DATABASE_URL),
         "training_questions_bank": len(QUESTION_BANK),
         "training_questions_per_test": TEST_QUESTION_COUNT,
         "sites": len(SITES),
@@ -6580,6 +6680,7 @@ def set_webhook():
 
 
 if __name__ == "__main__":
+    init_postgres_storage()
     set_webhook()
 
     scheduler_thread = threading.Thread(
@@ -6592,7 +6693,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
 
     log.info(
-        "Starting Security Guard Bot v0.8 on port %s",
+        "Starting Security Guard Bot v0.9 on port %s",
         port
     )
 
