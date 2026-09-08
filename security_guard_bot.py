@@ -3405,8 +3405,9 @@ def admin_inline_menu():
         ],
         [
             {"text":"📋 Рапорти","callback_data":"admin:reports"},
-            {"text":"🏆 Рейтинг","callback_data":"admin:rating"}
+            {"text":"🌾 Зерновий звіт","callback_data":"admin:grainreports"}
         ],
+        [{"text":"🏆 Рейтинг","callback_data":"admin:rating"}],
         [{"text":"🕒 Журнал змін","callback_data":"admin:shifts"}],
         [
             {"text":"📚 База знань","callback_data":"admin:knowledge"},
@@ -3954,6 +3955,32 @@ def show_leadership_text(group):
         lines.append(f"📞 {escape(row.get('phone') or 'телефон не вказаний')}")
         lines.append("")
     return "\n".join(lines)
+
+
+def send_leadership_cards(chat_id, group):
+    """Показує охороні актуальне керівництво, включно з фото, доданими адміністратором."""
+    data = load_data()
+    rows = list(LEADERSHIP.get(group, [])) + list((data.get("leadership_custom") or {}).get(group, []))
+    if not rows:
+        send_message(chat_id, f"👔 <b>Керівництво {escape(group)}</b>\n\nДані ще не внесені.", leadership_keyboard())
+        return
+    for row in rows:
+        caption = (
+            f"👔 <b>Керівництво {escape(group)}</b>\n\n"
+            f"👤 <b>{escape(row.get('full_name') or '—')}</b>\n"
+            f"💼 {escape(row.get('position') or '—')}\n"
+            f"📞 {escape(row.get('phone') or 'телефон не вказаний')}"
+        )
+        photo_id = row.get("photo_file_id")
+        if photo_id:
+            try:
+                send_photo(chat_id, photo_id, caption=caption)
+            except Exception as exc:
+                print("LEADERSHIP PHOTO ERROR:", repr(exc))
+                send_message(chat_id, caption + "\n📷 Фото тимчасово не відображається.")
+        else:
+            send_message(chat_id, caption)
+    send_message(chat_id, "Оберіть розділ:", leadership_keyboard())
 
 
 def category_keyboard(prefix, categories):
@@ -4573,6 +4600,51 @@ SHIFT_ACTIVITY_OPTIONS = [
     ("rail_out", "Відвантаження з/д"),
 ]
 
+GRAIN_INTAKE_OPTIONS = [
+    ("sunflower", "Соняшник"),
+    ("high_oleic_sunflower", "Соняшник олеїновий"),
+    ("wheat", "Пшениця"),
+    ("corn", "Кукурудза"),
+]
+
+GRAIN_SHIPMENT_OPTIONS = [
+    ("sunflower", "Соняшник"),
+    ("high_oleic_sunflower", "Соняшник олеїновий"),
+    ("corn", "Кукурудза"),
+    ("crushed_grain", "Подрібнене зерно"),
+    ("waste_cat3", "Відходи 3-ї категорії"),
+    ("rapeseed", "Ріпак"),
+]
+
+def grain_select_keyboard(direction, selected=None):
+    selected = set(selected or [])
+    options = GRAIN_INTAKE_OPTIONS if direction == "in" else GRAIN_SHIPMENT_OPTIONS
+    rows = []
+    for key, label in options:
+        rows.append([{"text":f"{'✅' if key in selected else '⬜'} {label}", "callback_data":f"grain:{direction}:toggle:{key}"}])
+    rows.append([{"text":"➡️ Продовжити", "callback_data":f"grain:{direction}:continue"}])
+    rows.append([{"text":"❌ Скасувати", "callback_data":"menu:shift"}])
+    return inline(rows)
+
+def grain_label(direction, key):
+    return dict(GRAIN_INTAKE_OPTIONS if direction == "in" else GRAIN_SHIPMENT_OPTIONS).get(key, key)
+
+def _parse_positive_number(text):
+    raw = (text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return value if value >= 0 else None
+
+def _format_tons(value):
+    try:
+        v = float(value)
+        return f"{v:,.3f}".replace(",", " ")
+    except Exception:
+        return str(value or 0)
+
+
 def shift_calendar_keyboard(year=None, month=None):
     now = datetime.now(KYIV_TZ)
     year = int(year or now.year)
@@ -4689,6 +4761,10 @@ def finalize_shift_report(tg_id, payload):
         "change_present": bool(payload.get("change_present")),
         "activities": list(payload.get("activities") or []),
         "remarks_present": bool(payload.get("remarks_present")),
+        "received_vehicles": int(payload.get("received_vehicles") or 0),
+        "intake_tonnage": dict(payload.get("intake_tonnage") or {}),
+        "shipped_vehicles": int(payload.get("shipped_vehicles") or 0),
+        "shipment_tonnage": dict(payload.get("shipment_tonnage") or {}),
         "report_created_at": utc_now_iso(),
     }
     data["shifts"][str(shift_id)] = row
@@ -4723,6 +4799,22 @@ def shift_report_text(row, admin_copy=False):
         "",
         f"⚠️ Зауваження: <b>{'Є' if row.get('remarks_present') else 'Немає'}</b>",
     ]
+    intake = row.get("intake_tonnage") or {}
+    shipment = row.get("shipment_tonnage") or {}
+    lines += ["", "🌾 <b>ЗВІТ ЗА ЗМІНУ</b>", f"🚛 Прийнято ТЗ: <b>{int(row.get('received_vehicles') or 0)}</b>"]
+    if intake:
+        lines.append("📥 <b>Приймання:</b>")
+        for key, value in intake.items():
+            lines.append(f"• {escape(grain_label('in', key))}: <b>{escape(_format_tons(value))} т</b>")
+    else:
+        lines.append("📥 Приймання культур: немає")
+    lines.append(f"🚚 Відвантажено авто: <b>{int(row.get('shipped_vehicles') or 0)}</b>")
+    if shipment:
+        lines.append("📤 <b>Відвантаження:</b>")
+        for key, value in shipment.items():
+            lines.append(f"• {escape(grain_label('out', key))}: <b>{escape(_format_tons(value))} т</b>")
+    else:
+        lines.append("📤 Відвантаження культур: немає")
     if admin_copy:
         lines += ["", f"🆔 Рапорт/зміна №{row.get('id')}"]
     return "\n".join(lines)
@@ -4753,6 +4845,37 @@ def admin_reports_for_date_text(site, report_date):
     for r in reports:
         blocks.append(shift_report_text(r, admin_copy=True))
     return "\n\n────────────\n\n".join(blocks)[:4000]
+
+def grain_reports_dates_keyboard():
+    reports = list(load_data().get("shift_reports", {}).values())
+    dates = sorted({r.get("report_date") for r in reports if r.get("report_date")}, reverse=True)
+    rows = [[{"text":f"📅 {d}", "callback_data":f"admingrain:date:{d}"}] for d in dates[:90]]
+    if not rows:
+        rows.append([{"text":"📭 Звітів ще немає", "callback_data":"noop"}])
+    rows.append([{"text":"⬅️ Адмінка", "callback_data":"home:admin"}])
+    return inline(rows)
+
+def grain_report_for_date_text(report_date):
+    reports = [r for r in load_data().get("shift_reports", {}).values() if r.get("report_date") == report_date]
+    if not reports:
+        return f"🌾 <b>Зерновий звіт</b>\n📅 {escape(report_date)}\n\n📭 Немає записів."
+    received = sum(int(r.get("received_vehicles") or 0) for r in reports)
+    shipped = sum(int(r.get("shipped_vehicles") or 0) for r in reports)
+    intake, shipment = {}, {}
+    for r in reports:
+        for k,v in (r.get("intake_tonnage") or {}).items(): intake[k] = intake.get(k,0.0) + float(v or 0)
+        for k,v in (r.get("shipment_tonnage") or {}).items(): shipment[k] = shipment.get(k,0.0) + float(v or 0)
+    lines=["🌾 <b>ЗВІТ ЗА ЗМІНУ / ДОБУ</b>", f"📅 <b>{escape(report_date)}</b>", "", f"🚛 Прийнято ТЗ: <b>{received}</b>", "📥 <b>Приймання:</b>"]
+    if intake:
+        for k,v in intake.items(): lines.append(f"• {escape(grain_label('in',k))}: <b>{escape(_format_tons(v))} т</b>")
+    else: lines.append("• немає")
+    lines += ["", f"🚚 Відвантажено авто: <b>{shipped}</b>", "📤 <b>Відвантаження:</b>"]
+    if shipment:
+        for k,v in shipment.items(): lines.append(f"• {escape(grain_label('out',k))}: <b>{escape(_format_tons(v))} т</b>")
+    else: lines.append("• немає")
+    lines += ["", f"📋 Рапортів за дату: <b>{len(reports)}</b>"]
+    return "\n".join(lines)[:4000]
+
 
 def patrol_post_keyboard():
     return inline([
@@ -5947,17 +6070,70 @@ def handle_callback(cq):
             answer_callback(cq["id"], "Почни оформлення зміни заново")
             return
         payload["remarks_present"] = value == "yes"
-        row = finalize_shift_report(tg_id, payload)
-        clear_state(tg_id)
-        answer_callback(cq["id"], "Рапорт збережено")
-        edit_message(
-            tg_id, cq["message"]["message_id"],
-            "✅ <b>Зміну розпочато. Рапорт збережено.</b>\n\n" + shift_report_text(row),
-            shift_menu()
-        )
-        send_message(ADMIN_ID, "📨 <b>Новий рапорт зміни</b>\n\n" + shift_report_text(row, admin_copy=True))
-        if (row.get("post2") or {}).get("name") and not (row.get("post2") or {}).get("telegram_id"):
-            send_message(ADMIN_ID, "⚠️ Пост №2 у цьому рапорті не має прив’язаного Telegram ID; автоматичні нагадування про патрулювання не надійдуть напряму працівнику.")
+        set_state(tg_id, "shift_received_vehicles", payload)
+        answer_callback(cq["id"])
+        edit_message(tg_id, cq["message"]["message_id"], "🌾 <b>Звіт за зміну</b>\n\n8. Введи цифрами <b>кількість прийнятих ТЗ</b> (якщо не було — 0):", inline([[{"text":"❌ Скасувати","callback_data":"menu:shift"}]]))
+        return
+
+    if data_cb.startswith("grain:"):
+        parts = data_cb.split(":")
+        if len(parts) < 3:
+            answer_callback(cq["id"], "Некоректна дія"); return
+        direction = parts[1]
+        action = parts[2]
+        state, payload = get_state(tg_id)
+        expected = "shift_intake_select" if direction == "in" else "shift_shipment_select"
+        if state != expected:
+            answer_callback(cq["id"], "Почни оформлення зміни заново"); return
+        key_name = "intake_selected" if direction == "in" else "shipment_selected"
+        selected = list(payload.get(key_name) or [])
+        if action == "toggle" and len(parts) == 4:
+            key = parts[3]
+            allowed = dict(GRAIN_INTAKE_OPTIONS if direction == "in" else GRAIN_SHIPMENT_OPTIONS)
+            if key not in allowed:
+                answer_callback(cq["id"], "Культуру не знайдено"); return
+            if key in selected: selected.remove(key)
+            else: selected.append(key)
+            payload[key_name] = selected
+            set_state(tg_id, expected, payload)
+            answer_callback(cq["id"])
+            edit_message(tg_id, cq["message"]["message_id"], ("📥 <b>Приймання культур</b>" if direction=="in" else "📤 <b>Відвантаження</b>") + "\n\nОбери потрібні позиції та натисни «Продовжити»:", grain_select_keyboard(direction, selected))
+            return
+        if action == "continue":
+            answer_callback(cq["id"])
+            if not selected:
+                if direction == "in":
+                    payload["intake_tonnage"] = {}
+                    set_state(tg_id, "shift_shipped_vehicles", payload)
+                    edit_message(tg_id, cq["message"]["message_id"], "🌾 <b>Звіт за зміну</b>\n\n10. Введи цифрами <b>кількість авто на відвантаження</b> (якщо не було — 0):", inline([[{"text":"❌ Скасувати","callback_data":"menu:shift"}]]))
+                else:
+                    payload["shipment_tonnage"] = {}
+                    row = finalize_shift_report(tg_id, payload); clear_state(tg_id)
+                    edit_message(tg_id, cq["message"]["message_id"], "✅ <b>Зміну розпочато. Рапорт збережено.</b>\n\n" + shift_report_text(row), shift_menu())
+                    send_message(ADMIN_ID, "📨 <b>Новий рапорт зміни</b>\n\n" + shift_report_text(row, admin_copy=True))
+                return
+            payload["grain_direction"] = direction
+            payload["grain_queue"] = selected
+            payload["grain_index"] = 0
+            payload["grain_values"] = {}
+            set_state(tg_id, "shift_grain_tonnage", payload)
+            first = selected[0]
+            edit_message(tg_id, cq["message"]["message_id"], f"⚖️ Введи тоннаж цифрами для <b>{escape(grain_label(direction, first))}</b>.\nНаприклад: <code>125.500</code>", inline([[{"text":"❌ Скасувати","callback_data":"menu:shift"}]]))
+            return
+
+    if data_cb == "admin:grainreports":
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав"); return
+        answer_callback(cq["id"])
+        edit_message(tg_id, cq["message"]["message_id"], "🌾 <b>Зернові звіти</b>\n\nОбери дату:", grain_reports_dates_keyboard())
+        return
+
+    if data_cb.startswith("admingrain:date:"):
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав"); return
+        report_date = data_cb.split(":",2)[2]
+        answer_callback(cq["id"])
+        edit_message(tg_id, cq["message"]["message_id"], grain_report_for_date_text(report_date), inline([[{"text":"⬅️ До дат","callback_data":"admin:grainreports"}],[{"text":"🏠 Адмінка","callback_data":"home:admin"}]]))
         return
 
     if data_cb.startswith("shift:manual:"):
@@ -6272,13 +6448,8 @@ def handle_callback(cq):
     if data_cb.startswith("lead:"):
         group = data_cb.split(":",1)[1]
         answer_callback(cq["id"])
-
-        edit_message(
-            tg_id,
-            cq["message"]["message_id"],
-            show_leadership_text(group),
-            leadership_keyboard()
-        )
+        edit_message(tg_id, cq["message"]["message_id"], f"👔 <b>Керівництво {escape(group)}</b>\n\nЗавантажую актуальні картки…", inline([]))
+        send_leadership_cards(tg_id, group)
         return
 
     # =====================================================
@@ -6570,7 +6741,7 @@ def handle_start(msg):
             tg_id,
             "🛡 <b>Службовий бот охорони</b>\n\n"
             "Режим адміністратора.\n"
-            "Версія: <b>v0.10</b>\n"
+            "Версія: <b>v0.11</b>\n"
             "🧪 Тимчасове сховище без PostgreSQL.",
             admin_inline_menu()
         )
@@ -6698,6 +6869,56 @@ def handle_text(msg):
             "🚚 <b>Роботи на зміні</b>\n\n7. Обери один або декілька варіантів. Мінімум один:",
             shift_activities_keyboard([])
         )
+        return
+
+    # ---------- SHIFT: GRAIN / VEHICLE REPORT ----------
+    if state == "shift_received_vehicles":
+        if not text.isdigit():
+            send_message(tg_id, "Введи тільки ціле число, наприклад <code>12</code> або <code>0</code>."); return
+        payload["received_vehicles"] = int(text)
+        payload["intake_selected"] = []
+        set_state(tg_id, "shift_intake_select", payload)
+        send_message(tg_id, "📥 <b>Приймання культур</b>\n\n9. Обери культури, які приймали. Якщо приймання не було — одразу «Продовжити».", grain_select_keyboard("in", []))
+        return
+
+    if state == "shift_shipped_vehicles":
+        if not text.isdigit():
+            send_message(tg_id, "Введи тільки ціле число, наприклад <code>8</code> або <code>0</code>."); return
+        payload["shipped_vehicles"] = int(text)
+        payload["shipment_selected"] = []
+        set_state(tg_id, "shift_shipment_select", payload)
+        send_message(tg_id, "📤 <b>Відвантаження</b>\n\n11. Обери продукцію, яку відвантажували. Якщо не було — одразу «Продовжити».", grain_select_keyboard("out", []))
+        return
+
+    if state == "shift_grain_tonnage":
+        value = _parse_positive_number(text)
+        if value is None:
+            send_message(tg_id, "Введи тоннаж тільки цифрами. Можна з крапкою або комою, наприклад <code>125.500</code>."); return
+        direction = payload.get("grain_direction")
+        queue = payload.get("grain_queue") or []
+        idx = int(payload.get("grain_index") or 0)
+        if idx >= len(queue):
+            send_message(tg_id, "Оформлення збилося. Почни зміну заново.", shift_menu()); clear_state(tg_id); return
+        values = dict(payload.get("grain_values") or {})
+        values[queue[idx]] = value
+        idx += 1
+        payload["grain_values"] = values
+        payload["grain_index"] = idx
+        if idx < len(queue):
+            set_state(tg_id, "shift_grain_tonnage", payload)
+            send_message(tg_id, f"⚖️ Введи тоннаж цифрами для <b>{escape(grain_label(direction, queue[idx]))}</b>:"); return
+        if direction == "in":
+            payload["intake_tonnage"] = values
+            set_state(tg_id, "shift_shipped_vehicles", payload)
+            send_message(tg_id, "🌾 <b>Звіт за зміну</b>\n\n10. Введи цифрами <b>кількість авто на відвантаження</b> (якщо не було — 0):")
+            return
+        payload["shipment_tonnage"] = values
+        row = finalize_shift_report(tg_id, payload)
+        clear_state(tg_id)
+        send_message(tg_id, "✅ <b>Зміну розпочато. Рапорт збережено.</b>\n\n" + shift_report_text(row), shift_menu())
+        send_message(ADMIN_ID, "📨 <b>Новий рапорт зміни</b>\n\n" + shift_report_text(row, admin_copy=True))
+        if (row.get("post2") or {}).get("name") and not (row.get("post2") or {}).get("telegram_id"):
+            send_message(ADMIN_ID, "⚠️ Пост №2 у цьому рапорті не має прив’язаного Telegram ID; автоматичні нагадування про патрулювання не надійдуть напряму працівнику.")
         return
 
     # ---------- ADMIN: SOS PHONE CONTACTS ----------
@@ -6861,7 +7082,8 @@ def handle_photo(msg):
             return
         save_leadership_custom(payload, photos[-1]["file_id"])
         clear_state(tg_id)
-        send_message(tg_id, "✅ Керівника з фото додано.", admin_inline_menu())
+        send_message(tg_id, "✅ Керівника з фото додано. Фото збережене через Telegram file_id і буде показуватися охороні в розділі «Керівництво».", admin_inline_menu())
+        send_photo(tg_id, photos[-1]["file_id"], caption=f"👤 <b>{escape(payload.get('full_name') or '—')}</b>\n💼 {escape(payload.get('position') or '—')}\n📞 {escape(payload.get('phone') or '—')}")
         return
 
     if state != "defect_photo":
@@ -6894,7 +7116,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "security_guard_bot",
-        "version": "0.10",
+        "version": "0.11",
         "storage": "postgresql_guard_app_state",
         "database_configured": bool(DATABASE_URL),
         "training_questions_bank": len(QUESTION_BANK),
