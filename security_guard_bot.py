@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from html import escape
 
@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, request, jsonify
 
 # =========================================================
-# SECURITY GUARD BOT v0.9
+# SECURITY GUARD BOT v0.10
 # PostgreSQL persistence через окрему guard_* таблицю.
 #
 # Нове:
@@ -2865,6 +2865,7 @@ DEFAULT_DATA = {
     "patrols": {},
     "events": {},
     "defects": {},
+    "shift_reports": {},
     "next_request_id": 1,
     "next_attempt_id": 1,
     "next_shift_id": 1,
@@ -2919,7 +2920,7 @@ def init_postgres_storage():
                     cur.execute(
                         """
                         INSERT INTO guard_schema_meta(key, value, updated_at)
-                        VALUES ('storage_version', '0.9', NOW())
+                        VALUES ('storage_version', '0.10', NOW())
                         ON CONFLICT (key) DO UPDATE
                         SET value = EXCLUDED.value, updated_at = NOW()
                         """
@@ -3403,9 +3404,10 @@ def admin_inline_menu():
             {"text":"🏢 Дільниці","callback_data":"admin:sites"}
         ],
         [
-            {"text":"🕒 Зміни","callback_data":"admin:shifts"},
+            {"text":"📋 Рапорти","callback_data":"admin:reports"},
             {"text":"🏆 Рейтинг","callback_data":"admin:rating"}
         ],
+        [{"text":"🕒 Журнал змін","callback_data":"admin:shifts"}],
         [
             {"text":"📚 База знань","callback_data":"admin:knowledge"},
             {"text":"📖 Процедура","callback_data":"menu:procedure"}
@@ -3431,7 +3433,6 @@ def shift_menu():
             {"text":"⚠️ Недолік","callback_data":"shift:defect"}
         ],
         [{"text":"📋 Моє чергування","callback_data":"shift:current"}],
-        [{"text":"🔴 Завершити зміну","callback_data":"shift:end"}],
         [{"text":"⬅️ Назад","callback_data":"home:user"}],
     ])
 
@@ -4274,25 +4275,31 @@ def admin_users_text():
 
 def admin_results_text():
     rows = all_attempts()
-
     if not rows:
         return "🎓 Результатів поки немає."
 
-    lines = ["🎓 <b>Останні результати</b>", ""]
+    grouped = {}
+    for a in rows:
+        site = a.get("site") or "Без дільниці"
+        date = (a.get("finished_at") or "")[:10] or "Без дати"
+        grouped.setdefault(site, {}).setdefault(date, []).append(a)
 
-    for a in rows[:25]:
-        icon = "✅" if a.get("passed") else "⚠️"
-        date = (a.get("finished_at") or "")[:10]
-
-        lines.append(
-            f"{icon} <b>{escape(a.get('full_name') or '—')}</b> — "
-            f"{a.get('percent',0)}%\n"
-            f"🏢 {escape(a.get('site') or '—')} | "
-            f"💼 {escape(a.get('position') or '—')} | "
-            f"{date}"
-        )
-
-    return "\n\n".join(lines)
+    lines = ["🎓 <b>Результати тестування</b>", ""]
+    ordered_sites = [s for s in SITES if s in grouped] + [s for s in sorted(grouped) if s not in SITES]
+    for site in ordered_sites:
+        lines.append(f"🏢 <b>{escape(site)}</b>")
+        for date in sorted(grouped[site], reverse=True):
+            lines.append(f"📅 <b>{escape(date)}</b>")
+            items = sorted(grouped[site][date], key=lambda a: (a.get("full_name") or "", -(a.get("percent") or 0)))
+            for a in items:
+                icon = "✅" if a.get("passed") else "⚠️"
+                lines.append(
+                    f"{icon} {escape(a.get('full_name') or '—')} — <b>{a.get('percent',0)}%</b> · "
+                    f"{escape(a.get('position') or '—')}"
+                )
+            lines.append("")
+        lines.append("")
+    return "\n".join(lines)[:4000]
 
 def admin_stats_text():
     data = load_data()
@@ -4546,6 +4553,7 @@ def shift_member_keyboard(site, post_no, exclude_name=None):
         })
     people.sort(key=lambda x: x["name"])
     rows = [[{"text":p["name"],"callback_data":f"shift:member:{post_no}:{i}"}] for i,p in enumerate(people)]
+    rows.append([{"text":"✍️ Ввести ПІБ вручну","callback_data":f"shift:manual:{post_no}"}])
     rows.append([{"text":"❌ Скасувати","callback_data":"menu:shift"}])
     return inline(rows), people
 
@@ -4553,9 +4561,198 @@ def shift_member_keyboard(site, post_no, exclude_name=None):
 def master_keyboard(site):
     masters = MASTERS_BY_SITE.get(site, [])
     rows = [[{"text":name,"callback_data":f"shift:master:{i}"}] for i,name in enumerate(masters)]
+    rows.append([{"text":"✍️ Ввести майстра вручну","callback_data":"shift:master:manual"}])
     rows.append([{"text":"❌ Скасувати","callback_data":"menu:shift"}])
     return inline(rows), masters
 
+
+SHIFT_SINGLE_POST_SITES = {"Бобрик", "Андріяшівка"}
+SHIFT_ACTIVITY_OPTIONS = [
+    ("car_in", "Приймання авто"),
+    ("car_out", "Відвантаження авто"),
+    ("rail_out", "Відвантаження з/д"),
+]
+
+def shift_calendar_keyboard(year=None, month=None):
+    now = datetime.now(KYIV_TZ)
+    year = int(year or now.year)
+    month = int(month or now.month)
+    import calendar
+    cal = calendar.Calendar(firstweekday=0)
+    month_name = ["", "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень", "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень"][month]
+    rows = [[{"text":f"📅 {month_name} {year}","callback_data":"noop"}]]
+    rows.append([{"text":d,"callback_data":"noop"} for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Нд"]])
+    for week in cal.monthdayscalendar(year, month):
+        row=[]
+        for day in week:
+            if day:
+                row.append({"text":str(day),"callback_data":f"shiftcal:{year}:{month}:{day}"})
+            else:
+                row.append({"text":"·","callback_data":"noop"})
+        rows.append(row)
+    prev_month = month - 1 or 12
+    prev_year = year - 1 if month == 1 else year
+    next_month = month + 1 if month < 12 else 1
+    next_year = year + 1 if month == 12 else year
+    rows.append([
+        {"text":"⬅️","callback_data":f"shiftcalnav:{prev_year}:{prev_month}"},
+        {"text":"Сьогодні","callback_data":f"shiftcal:{now.year}:{now.month}:{now.day}"},
+        {"text":"➡️","callback_data":f"shiftcalnav:{next_year}:{next_month}"},
+    ])
+    rows.append([{"text":"❌ Скасувати","callback_data":"menu:shift"}])
+    return inline(rows)
+
+def shift_type_keyboard():
+    return inline([
+        [{"text":"☀️ Денна 08:00–20:00","callback_data":"shifttype:day"}],
+        [{"text":"🌙 Нічна 20:00–08:00","callback_data":"shifttype:night"}],
+        [{"text":"❌ Скасувати","callback_data":"menu:shift"}],
+    ])
+
+def shift_change_presence_keyboard():
+    return inline([
+        [{"text":"✅ Зміна є","callback_data":"shiftpresence:yes"}],
+        [{"text":"➖ Зміни немає","callback_data":"shiftpresence:no"}],
+        [{"text":"❌ Скасувати","callback_data":"menu:shift"}],
+    ])
+
+def shift_activities_keyboard(selected=None):
+    selected = set(selected or [])
+    rows=[]
+    for key, label in SHIFT_ACTIVITY_OPTIONS:
+        mark = "✅" if key in selected else "⬜"
+        rows.append([{"text":f"{mark} {label}","callback_data":f"shiftactivity:{key}"}])
+    rows.append([{"text":"➡️ Продовжити","callback_data":"shiftactivity:continue"}])
+    rows.append([{"text":"❌ Скасувати","callback_data":"menu:shift"}])
+    return inline(rows)
+
+def shift_remarks_keyboard():
+    return inline([
+        [{"text":"✅ Зауважень немає","callback_data":"shiftremarks:no"}],
+        [{"text":"⚠️ Зауваження є","callback_data":"shiftremarks:yes"}],
+        [{"text":"❌ Скасувати","callback_data":"menu:shift"}],
+    ])
+
+def _shift_window(report_date, shift_type):
+    d = datetime.strptime(report_date, "%Y-%m-%d").date()
+    if shift_type == "night":
+        start = datetime(d.year, d.month, d.day, 20, 0, tzinfo=KYIV_TZ)
+        end = start + timedelta(hours=12)
+        label = "🌙 Нічна"
+        hours = "20:00–08:00"
+    else:
+        start = datetime(d.year, d.month, d.day, 8, 0, tzinfo=KYIV_TZ)
+        end = datetime(d.year, d.month, d.day, 20, 0, tzinfo=KYIV_TZ)
+        label = "☀️ Денна"
+        hours = "08:00–20:00"
+    return start, end, label, hours
+
+def _initial_shift_status(report_date, shift_type):
+    start, end, _, _ = _shift_window(report_date, shift_type)
+    now = datetime.now(KYIV_TZ)
+    if now < start:
+        return "planned"
+    if now >= end:
+        return "finished"
+    return "active"
+
+def finalize_shift_report(tg_id, payload):
+    site = payload.get("site") or (get_user(tg_id) or {}).get("site") or "—"
+    report_date = payload.get("report_date")
+    shift_type = payload.get("shift_type", "day")
+    start, end, shift_label, hours = _shift_window(report_date, shift_type)
+    data = load_data()
+    # Нова зміна тієї ж дільниці автоматично закриває попередній активний запис.
+    for old in data.get("shifts", {}).values():
+        if old.get("site") == site and old.get("status") == "active":
+            old["status"] = "finished"
+            old["finished_at"] = utc_now_iso()
+    shift_id = next_id(data, "next_shift_id")
+    post2_name = payload.get("post2_name") or None
+    row = {
+        "id": shift_id,
+        "telegram_id": tg_id,
+        "site": site,
+        "report_date": report_date,
+        "shift_type": shift_type,
+        "shift_label": shift_label,
+        "shift_hours": hours,
+        "scheduled_start_at": start.isoformat(),
+        "scheduled_end_at": end.isoformat(),
+        "started_at": start.isoformat(),
+        "finished_at": None,
+        "status": _initial_shift_status(report_date, shift_type),
+        "post1": {"name": payload.get("post1_name"), "telegram_id": payload.get("post1_tg_id"), "role":"Старший охоронник"},
+        "post2": {"name": post2_name, "telegram_id": payload.get("post2_tg_id"), "role":"Охоронник-пожежник"} if post2_name else {},
+        "patrol_post": 2 if post2_name else None,
+        "master": payload.get("master"),
+        "change_present": bool(payload.get("change_present")),
+        "activities": list(payload.get("activities") or []),
+        "remarks_present": bool(payload.get("remarks_present")),
+        "report_created_at": utc_now_iso(),
+    }
+    data["shifts"][str(shift_id)] = row
+    data.setdefault("shift_reports", {})[str(shift_id)] = dict(row)
+    save_data(data)
+    return row
+
+def shift_report_text(row, admin_copy=False):
+    labels = dict(SHIFT_ACTIVITY_OPTIONS)
+    activities = row.get("activities") or []
+    lines = [
+        "📋 <b>РАПОРТ ПРО ПОЧАТОК ЗМІНИ</b>",
+        "",
+        f"🏢 Дільниця: <b>{escape(row.get('site') or '—')}</b>",
+        f"📅 Дата: <b>{escape(row.get('report_date') or '—')}</b>",
+        f"🕒 Зміна: <b>{escape(row.get('shift_label') or '—')}</b>",
+        f"⏰ Час: <b>{escape(row.get('shift_hours') or '—')}</b>",
+        "",
+        f"1️⃣ Пост №1: {escape((row.get('post1') or {}).get('name') or '—')}",
+    ]
+    if (row.get("post2") or {}).get("name"):
+        lines.append(f"2️⃣ Пост №2: {escape((row.get('post2') or {}).get('name') or '—')}")
+    lines += [
+        f"🔄 Зміна персоналу: <b>{'Зміна є' if row.get('change_present') else 'Зміни немає'}</b>",
+        f"👷 Майстер: {escape(row.get('master') or '—')}",
+        "",
+        "🚚 <b>Роботи:</b>",
+    ]
+    for key in activities:
+        lines.append(f"• {escape(labels.get(key, key))}")
+    lines += [
+        "",
+        f"⚠️ Зауваження: <b>{'Є' if row.get('remarks_present') else 'Немає'}</b>",
+    ]
+    if admin_copy:
+        lines += ["", f"🆔 Рапорт/зміна №{row.get('id')}"]
+    return "\n".join(lines)
+
+def admin_reports_sites_keyboard():
+    data = load_data()
+    reports = list(data.get("shift_reports", {}).values())
+    sites = [s for s in SITES if any(r.get("site") == s for r in reports)]
+    rows = [[{"text":s,"callback_data":f"adminreports:site:{SITES.index(s)}"}] for s in sites]
+    if not rows:
+        rows.append([{"text":"📭 Рапортів ще немає","callback_data":"noop"}])
+    rows.append([{"text":"⬅️ Адмінка","callback_data":"home:admin"}])
+    return inline(rows)
+
+def admin_reports_dates_keyboard(site):
+    reports = list(load_data().get("shift_reports", {}).values())
+    dates = sorted({r.get("report_date") for r in reports if r.get("site") == site and r.get("report_date")}, reverse=True)
+    rows = [[{"text":f"📅 {d}","callback_data":f"adminreports:date:{SITES.index(site)}:{d}"}] for d in dates[:60]]
+    rows.append([{"text":"⬅️ Дільниці","callback_data":"admin:reports"}])
+    return inline(rows)
+
+def admin_reports_for_date_text(site, report_date):
+    reports = [r for r in load_data().get("shift_reports", {}).values() if r.get("site") == site and r.get("report_date") == report_date]
+    reports.sort(key=lambda r: (r.get("shift_type") or "", r.get("id") or 0))
+    if not reports:
+        return f"📋 <b>Рапорти</b>\n\n🏢 {escape(site)}\n📅 {escape(report_date)}\n\n📭 Немає записів."
+    blocks=[f"📋 <b>Рапорти</b>\n🏢 <b>{escape(site)}</b> · 📅 <b>{escape(report_date)}</b>"]
+    for r in reports:
+        blocks.append(shift_report_text(r, admin_copy=True))
+    return "\n\n────────────\n\n".join(blocks)[:4000]
 
 def patrol_post_keyboard():
     return inline([
@@ -4915,15 +5112,36 @@ def stop_sos_alert(sos_id, actor_tg_id):
     return True, alert
 
 
+def sync_scheduled_shift_statuses(data, now=None):
+    now = now or datetime.now(KYIV_TZ)
+    changed = False
+    for row in data.get("shifts", {}).values():
+        start_s = row.get("scheduled_start_at")
+        end_s = row.get("scheduled_end_at")
+        if not start_s or not end_s:
+            continue
+        try:
+            start = datetime.fromisoformat(start_s)
+            end = datetime.fromisoformat(end_s)
+        except Exception:
+            continue
+        desired = "planned" if now < start else "active" if now < end else "finished"
+        if row.get("status") != desired:
+            row["status"] = desired
+            if desired == "finished" and not row.get("finished_at"):
+                row["finished_at"] = end.isoformat()
+            changed = True
+    return changed
+
 def scheduler_tick():
     now = datetime.now(KYIV_TZ)
     data = load_data()
-    changed = False
+    changed = sync_scheduled_shift_statuses(data, now)
 
     # Патрулювання: щогодини з 08:00, крім 11:00 і 13:00.
     active_shifts = [
         s for s in data["shifts"].values()
-        if s.get("status") == "active"
+        if s.get("status") == "active" and (s.get("post2") or {}).get("name")
     ]
 
     for shift in active_shifts:
@@ -5510,54 +5728,90 @@ def handle_callback(cq):
     # =====================================================
     # SHIFT SETUP
     # =====================================================
+    if data_cb == "noop":
+        answer_callback(cq["id"])
+        return
+
     if data_cb == "shift:start":
         user = get_user(tg_id) or {}
         if tg_id != ADMIN_ID and user.get("role") != "senior_guard":
             answer_callback(cq["id"], "Зміну створює тільки старший охоронник")
             return
-        if get_active_shift(tg_id):
-            answer_callback(cq["id"], "Зміна вже активна")
+        site = user.get("site")
+        answer_callback(cq["id"])
+        if not site:
+            set_state(tg_id, "shift_site_for_report", {})
             edit_message(
-                tg_id,
-                cq["message"]["message_id"],
-                shift_summary_text(tg_id),
-                shift_menu()
+                tg_id, cq["message"]["message_id"],
+                "🟢 <b>Розпочати зміну</b>\n\nСпочатку обери дільницю:",
+                site_keyboard("shiftreport")
             )
             return
-
-        set_state(tg_id, "shift_site", {})
-        answer_callback(cq["id"])
+        set_state(tg_id, "shift_date", {"site": site})
+        now = datetime.now(KYIV_TZ)
         edit_message(
-            tg_id,
-            cq["message"]["message_id"],
-            "🟢 <b>Заступити на зміну</b>\n\n"
-            "1/4. Обери дільницю:",
-            site_keyboard("shift")
+            tg_id, cq["message"]["message_id"],
+            "🟢 <b>Розпочати зміну</b>\n\n1. Обери дату:",
+            shift_calendar_keyboard(now.year, now.month)
         )
         return
 
-    if data_cb.startswith("shift:site:"):
+    if data_cb.startswith("shiftreport:site:"):
         idx = int(data_cb.rsplit(":",1)[1])
+        if idx < 0 or idx >= len(SITES):
+            answer_callback(cq["id"], "Дільницю не знайдено")
+            return
         site = SITES[idx]
-        kb, people = shift_member_keyboard(site, 1)
-
-        set_state(
-            tg_id,
-            "shift_post1",
-            {
-                "site": site,
-                "people": people
-            }
-        )
-
+        set_state(tg_id, "shift_date", {"site": site})
+        now = datetime.now(KYIV_TZ)
         answer_callback(cq["id"])
+        edit_message(tg_id, cq["message"]["message_id"], "🟢 <b>Розпочати зміну</b>\n\n1. Обери дату:", shift_calendar_keyboard(now.year, now.month))
+        return
 
+    if data_cb.startswith("shiftcalnav:"):
+        _, ys, ms = data_cb.split(":")
+        answer_callback(cq["id"])
+        edit_message(tg_id, cq["message"]["message_id"], "🟢 <b>Розпочати зміну</b>\n\n1. Обери дату:", shift_calendar_keyboard(int(ys), int(ms)))
+        return
+
+    if data_cb.startswith("shiftcal:"):
+        _, ys, ms, ds = data_cb.split(":")
+        state, payload = get_state(tg_id)
+        if state != "shift_date":
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
+            return
+        try:
+            report_date = f"{int(ys):04d}-{int(ms):02d}-{int(ds):02d}"
+            datetime.strptime(report_date, "%Y-%m-%d")
+        except Exception:
+            answer_callback(cq["id"], "Некоректна дата")
+            return
+        payload["report_date"] = report_date
+        set_state(tg_id, "shift_type", payload)
+        answer_callback(cq["id"])
         edit_message(
-            tg_id,
-            cq["message"]["message_id"],
-            "🟢 <b>Заступити на зміну</b>\n\n"
-            f"🏢 {escape(site)}\n\n"
-            "2/4. Вкажи ПІБ <b>Пост №1 — Старший охоронник</b>:",
+            tg_id, cq["message"]["message_id"],
+            f"🟢 <b>Розпочати зміну</b>\n\n📅 {report_date}\n\n2. Обери тип зміни:",
+            shift_type_keyboard()
+        )
+        return
+
+    if data_cb.startswith("shifttype:"):
+        shift_type = data_cb.split(":",1)[1]
+        state, payload = get_state(tg_id)
+        if state != "shift_type" or shift_type not in ("day","night"):
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
+            return
+        payload["shift_type"] = shift_type
+        set_state(tg_id, "shift_post1", payload)
+        kb, _ = shift_member_keyboard(payload.get("site"), 1)
+        answer_callback(cq["id"])
+        shift_text = "☀️ Денна 08:00–20:00" if shift_type == "day" else "🌙 Нічна 20:00–08:00"
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "🟢 <b>Розпочати зміну</b>\n\n"
+            f"🏢 {escape(payload.get('site') or '—')}\n📅 {payload.get('report_date')}\n🕒 {shift_text}\n\n"
+            "3. Обери або введи ПІБ <b>Поста №1</b>:",
             kb
         )
         return
@@ -5568,61 +5822,63 @@ def handle_callback(cq):
         idx = int(idx_s)
         state, payload = get_state(tg_id)
         site = payload.get("site")
-
-        if post_no == 1 and state != "shift_post1":
-            answer_callback(cq["id"], "Почни заступання заново")
+        expected = "shift_post1" if post_no == 1 else "shift_post2"
+        if state != expected:
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
             return
-        if post_no == 2 and state != "shift_post2":
-            answer_callback(cq["id"], "Почни заступання заново")
-            return
-
         _, people = shift_member_keyboard(site, post_no)
-
         if idx < 0 or idx >= len(people):
             answer_callback(cq["id"], "Працівника не знайдено")
             return
-
         person = people[idx]
-
-        if post_no == 1:
-            next_payload = {
-                "site": site,
-                "post1_name": person["name"],
-                "post1_tg_id": person.get("telegram_id")
-            }
-            kb, _ = shift_member_keyboard(
-                site,
-                2,
-                exclude_name=person["name"]
-            )
-            set_state(tg_id, "shift_post2", next_payload)
-
-            answer_callback(cq["id"])
-
+        payload[f"post{post_no}_name"] = person["name"]
+        payload[f"post{post_no}_tg_id"] = person.get("telegram_id")
+        answer_callback(cq["id"])
+        if post_no == 1 and site not in SHIFT_SINGLE_POST_SITES:
+            set_state(tg_id, "shift_post2", payload)
+            kb, _ = shift_member_keyboard(site, 2, exclude_name=person["name"])
             edit_message(
-                tg_id,
-                cq["message"]["message_id"],
-                "🟢 <b>Заступити на зміну</b>\n\n"
-                f"🏢 {escape(site)}\n"
-                f"1️⃣ {escape(person['name'])}\n\n"
-                "3/4. Вкажи ПІБ <b>Пост №2 — Охоронник-пожежник</b>:",
-                kb
+                tg_id, cq["message"]["message_id"],
+                "🟢 <b>Розпочати зміну</b>\n\n"
+                f"1️⃣ Пост №1: {escape(person['name'])}\n\n"
+                "4. Обери або введи ПІБ <b>Поста №2</b>:", kb
             )
             return
+        set_state(tg_id, "shift_change_presence", payload)
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "🟢 <b>Розпочати зміну</b>\n\n5. Вкажи, чи є зміна персоналу:",
+            shift_change_presence_keyboard()
+        )
+        return
 
-        payload["post2_name"] = person["name"]
-        payload["post2_tg_id"] = person.get("telegram_id")
+    if data_cb.startswith("shiftpresence:"):
+        value = data_cb.split(":",1)[1]
+        state, payload = get_state(tg_id)
+        if state != "shift_change_presence":
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
+            return
+        payload["change_present"] = value == "yes"
         set_state(tg_id, "shift_master", payload)
-        kb, _ = master_keyboard(site)
+        kb, masters = master_keyboard(payload.get("site"))
         answer_callback(cq["id"])
         edit_message(
-            tg_id,
-            cq["message"]["message_id"],
-            "🟢 <b>Заступити на зміну</b>\n\n"
-            f"1️⃣ Пост №1: {escape(payload['post1_name'])}\n"
-            f"2️⃣ Пост №2: {escape(person['name'])}\n\n"
-            "4/4. Обери майстра зміни:",
-            kb
+            tg_id, cq["message"]["message_id"],
+            "🟢 <b>Розпочати зміну</b>\n\n6. Обери майстра згідно дільниці:", kb
+        )
+        return
+
+    if data_cb == "shift:master:manual":
+        state, payload = get_state(tg_id)
+        if state != "shift_master":
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
+            return
+        set_state(tg_id, "shift_manual_master", payload)
+        answer_callback(cq["id"])
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "✍️ Напиши в чаті повне ПІБ майстра.",
+            inline([[{"text":"❌ Скасувати","callback_data":"menu:shift"}]])
         )
         return
 
@@ -5630,22 +5886,78 @@ def handle_callback(cq):
         idx = int(data_cb.rsplit(":",1)[1])
         state, payload = get_state(tg_id)
         if state != "shift_master":
-            answer_callback(cq["id"], "Почни заступання заново")
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
             return
         masters = MASTERS_BY_SITE.get(payload.get("site"), [])
         if idx < 0 or idx >= len(masters):
             answer_callback(cq["id"], "Майстра не знайдено")
             return
-        master_name = masters[idx]
-        row, created = create_shift(
-            tg_id, payload["site"], payload["post1_name"], payload.get("post1_tg_id"),
-            payload["post2_name"], payload.get("post2_tg_id"), master_name=master_name, patrol_post=2
+        payload["master"] = masters[idx]
+        payload["activities"] = []
+        set_state(tg_id, "shift_activities", payload)
+        answer_callback(cq["id"])
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "🚚 <b>Роботи на зміні</b>\n\n7. Обери один або декілька варіантів. Мінімум один:",
+            shift_activities_keyboard([])
         )
+        return
+
+    if data_cb.startswith("shiftactivity:"):
+        action = data_cb.split(":",1)[1]
+        state, payload = get_state(tg_id)
+        if state != "shift_activities":
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
+            return
+        selected = list(payload.get("activities") or [])
+        valid = {k for k, _ in SHIFT_ACTIVITY_OPTIONS}
+        if action == "continue":
+            if not selected:
+                answer_callback(cq["id"], "Обери хоча б один вид робіт")
+                return
+            set_state(tg_id, "shift_remarks", payload)
+            answer_callback(cq["id"])
+            edit_message(
+                tg_id, cq["message"]["message_id"],
+                "⚠️ <b>Зауваження</b>\n\n8. Чи є зауваження на початок зміни?",
+                shift_remarks_keyboard()
+            )
+            return
+        if action not in valid:
+            answer_callback(cq["id"], "Невідомий варіант")
+            return
+        if action in selected:
+            selected.remove(action)
+        else:
+            selected.append(action)
+        payload["activities"] = selected
+        set_state(tg_id, "shift_activities", payload)
+        answer_callback(cq["id"], "Оновлено")
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "🚚 <b>Роботи на зміні</b>\n\n7. Обери один або декілька варіантів. Мінімум один:",
+            shift_activities_keyboard(selected)
+        )
+        return
+
+    if data_cb.startswith("shiftremarks:"):
+        value = data_cb.split(":",1)[1]
+        state, payload = get_state(tg_id)
+        if state != "shift_remarks":
+            answer_callback(cq["id"], "Почни оформлення зміни заново")
+            return
+        payload["remarks_present"] = value == "yes"
+        row = finalize_shift_report(tg_id, payload)
         clear_state(tg_id)
-        answer_callback(cq["id"], "Зміну розпочато")
-        edit_message(tg_id, cq["message"]["message_id"], "✅ <b>Зміну сформовано та розпочато</b>\n\n" + shift_summary_text(tg_id), shift_menu())
-        if not (row.get("post2") or {}).get("telegram_id"):
-            send_message(ADMIN_ID, "⚠️ <b>Пост №2 не має прив’язаного Telegram ID</b>\n\nНагадування про патрулювання надходять тільки Посту №2.")
+        answer_callback(cq["id"], "Рапорт збережено")
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "✅ <b>Зміну розпочато. Рапорт збережено.</b>\n\n" + shift_report_text(row),
+            shift_menu()
+        )
+        send_message(ADMIN_ID, "📨 <b>Новий рапорт зміни</b>\n\n" + shift_report_text(row, admin_copy=True))
+        if (row.get("post2") or {}).get("name") and not (row.get("post2") or {}).get("telegram_id"):
+            send_message(ADMIN_ID, "⚠️ Пост №2 у цьому рапорті не має прив’язаного Telegram ID; автоматичні нагадування про патрулювання не надійдуть напряму працівнику.")
         return
 
     if data_cb.startswith("shift:manual:"):
@@ -5675,48 +5987,6 @@ def handle_callback(cq):
                 {"text":"❌ Скасувати","callback_data":"menu:shift"}
             ]])
         )
-        return
-
-    if data_cb.startswith("shift:patrolpost:"):
-        patrol_post = int(data_cb.rsplit(":",1)[1])
-        state, payload = get_state(tg_id)
-
-        if state != "shift_patrol_post":
-            answer_callback(cq["id"], "Почни заступання заново")
-            return
-
-        row, created = create_shift(
-            tg_id,
-            payload["site"],
-            payload["post1_name"],
-            payload.get("post1_tg_id"),
-            payload["post2_name"],
-            payload.get("post2_tg_id"),
-            master_name=payload.get("master"),
-            patrol_post=2
-        )
-
-        clear_state(tg_id)
-        answer_callback(cq["id"], "Зміну розпочато")
-
-        edit_message(
-            tg_id,
-            cq["message"]["message_id"],
-            "✅ <b>Зміну сформовано та розпочато</b>\n\n"
-            + shift_summary_text(tg_id),
-            shift_menu()
-        )
-
-        patrol_member = row.get(f"post{patrol_post}", {})
-        if not patrol_member.get("telegram_id"):
-            send_message(
-                ADMIN_ID,
-                "⚠️ <b>Патрульний ПІБ не має прив’язаного Telegram ID</b>\n\n"
-                f"🏢 {escape(row.get('site') or '—')}\n"
-                f"👤 {escape(patrol_member.get('name') or '—')}\n\n"
-                "Нагадування не зможуть надходити напряму цьому працівнику, "
-                "доки його ПІБ не буде пов’язане з Telegram."
-            )
         return
 
     if data_cb == "shift:members":
@@ -5912,28 +6182,6 @@ def handle_callback(cq):
             cq["message"]["message_id"],
             shift_summary_text(tg_id),
             shift_menu()
-        )
-        return
-
-    if data_cb == "shift:end":
-        row = close_shift(tg_id)
-        answer_callback(cq["id"])
-
-        if not row:
-            text = "⚠️ Активної зміни немає."
-        else:
-            text = (
-                "🔴 <b>Зміну завершено</b>\n\n"
-                f"Зміна №{row['id']}\n"
-                f"Початок: {(row.get('started_at') or '')[:16].replace('T',' ')}\n"
-                f"Завершення: {(row.get('finished_at') or '')[:16].replace('T',' ')}"
-            )
-
-        edit_message(
-            tg_id,
-            cq["message"]["message_id"],
-            text,
-            main_inline_menu((get_user(tg_id) or {}).get("role"))
         )
         return
 
@@ -6215,6 +6463,57 @@ def handle_callback(cq):
         edit_message(tg_id, cq["message"]["message_id"], leadership_admin_text(), leadership_admin_keyboard())
         return
 
+    if data_cb == "admin:reports":
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав")
+            return
+        answer_callback(cq["id"])
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            "📋 <b>Рапорти змін</b>\n\nОбери дільницю:",
+            admin_reports_sites_keyboard()
+        )
+        return
+
+    if data_cb.startswith("adminreports:site:"):
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав")
+            return
+        idx = int(data_cb.rsplit(":",1)[1])
+        if idx < 0 or idx >= len(SITES):
+            answer_callback(cq["id"], "Дільницю не знайдено")
+            return
+        site = SITES[idx]
+        answer_callback(cq["id"])
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            f"📋 <b>Рапорти змін</b>\n\n🏢 {escape(site)}\nОбери дату:",
+            admin_reports_dates_keyboard(site)
+        )
+        return
+
+    if data_cb.startswith("adminreports:date:"):
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав")
+            return
+        parts = data_cb.split(":",3)
+        if len(parts) != 4:
+            answer_callback(cq["id"], "Некоректні дані")
+            return
+        idx = int(parts[2])
+        report_date = parts[3]
+        if idx < 0 or idx >= len(SITES):
+            answer_callback(cq["id"], "Дільницю не знайдено")
+            return
+        site = SITES[idx]
+        answer_callback(cq["id"])
+        edit_message(
+            tg_id, cq["message"]["message_id"],
+            admin_reports_for_date_text(site, report_date),
+            inline([[{"text":"⬅️ До дат","callback_data":f"adminreports:site:{idx}"}], [{"text":"🏠 Адмінка","callback_data":"home:admin"}]])
+        )
+        return
+
     if data_cb.startswith("admin:"):
         if tg_id != ADMIN_ID:
             answer_callback(cq["id"], "Недостатньо прав")
@@ -6271,7 +6570,7 @@ def handle_start(msg):
             tg_id,
             "🛡 <b>Службовий бот охорони</b>\n\n"
             "Режим адміністратора.\n"
-            "Версія: <b>v0.8</b>\n"
+            "Версія: <b>v0.10</b>\n"
             "🧪 Тимчасове сховище без PostgreSQL.",
             admin_inline_menu()
         )
@@ -6360,23 +6659,19 @@ def handle_text(msg):
         if len(text) < 5:
             send_message(tg_id, "Введи повне ПІБ.")
             return
-
         payload["post1_name"] = text
-        payload["post1_tg_id"] = find_linked_tg_id(text, payload["site"])
-
-        kb, _ = shift_member_keyboard(
-            payload["site"],
-            2,
-            exclude_name=text
-        )
-
+        payload["post1_tg_id"] = find_linked_tg_id(text, payload.get("site"))
+        if payload.get("site") in SHIFT_SINGLE_POST_SITES:
+            set_state(tg_id, "shift_change_presence", payload)
+            send_message(tg_id, "🟢 <b>Розпочати зміну</b>\n\n5. Вкажи, чи є зміна персоналу:", shift_change_presence_keyboard())
+            return
         set_state(tg_id, "shift_post2", payload)
-
+        kb, _ = shift_member_keyboard(payload.get("site"), 2, exclude_name=text)
         send_message(
             tg_id,
-            "🟢 <b>Заступити на зміну</b>\n\n"
+            "🟢 <b>Розпочати зміну</b>\n\n"
             f"1️⃣ Пост №1: {escape(text)}\n\n"
-            "3/4. Вкажи ПІБ <b>Пост №2 — Охоронник-пожежник</b>:",
+            "4. Обери або введи ПІБ <b>Поста №2</b>:",
             kb
         )
         return
@@ -6385,19 +6680,23 @@ def handle_text(msg):
         if len(text) < 5:
             send_message(tg_id, "Введи повне ПІБ.")
             return
-
         payload["post2_name"] = text
-        payload["post2_tg_id"] = find_linked_tg_id(text, payload["site"])
+        payload["post2_tg_id"] = find_linked_tg_id(text, payload.get("site"))
+        set_state(tg_id, "shift_change_presence", payload)
+        send_message(tg_id, "🟢 <b>Розпочати зміну</b>\n\n5. Вкажи, чи є зміна персоналу:", shift_change_presence_keyboard())
+        return
 
-        set_state(tg_id, "shift_patrol_post", payload)
-
+    if state == "shift_manual_master":
+        if len(text) < 5:
+            send_message(tg_id, "Введи повне ПІБ майстра.")
+            return
+        payload["master"] = text
+        payload["activities"] = []
+        set_state(tg_id, "shift_activities", payload)
         send_message(
             tg_id,
-            "🟢 <b>Заступити на зміну</b>\n\n"
-            f"1️⃣ Пост №1: {escape(payload['post1_name'])}\n"
-            f"2️⃣ Пост №2: {escape(text)}\n\n"
-            "4/4. Який пост виконує погодинне патрулювання?",
-            patrol_post_keyboard()
+            "🚚 <b>Роботи на зміні</b>\n\n7. Обери один або декілька варіантів. Мінімум один:",
+            shift_activities_keyboard([])
         )
         return
 
@@ -6595,7 +6894,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "security_guard_bot",
-        "version": "0.9",
+        "version": "0.10",
         "storage": "postgresql_guard_app_state",
         "database_configured": bool(DATABASE_URL),
         "training_questions_bank": len(QUESTION_BANK),
@@ -6693,7 +6992,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
 
     log.info(
-        "Starting Security Guard Bot v0.9 on port %s",
+        "Starting Security Guard Bot v0.10 on port %s",
         port
     )
 
