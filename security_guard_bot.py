@@ -2866,6 +2866,8 @@ DEFAULT_DATA = {
     "events": {},
     "defects": {},
     "shift_reports": {},
+    "generator_reports": {},
+    "next_generator_report_id": 1,
     "next_request_id": 1,
     "next_attempt_id": 1,
     "next_shift_id": 1,
@@ -2920,7 +2922,7 @@ def init_postgres_storage():
                     cur.execute(
                         """
                         INSERT INTO guard_schema_meta(key, value, updated_at)
-                        VALUES ('storage_version', '0.10', NOW())
+                        VALUES ('storage_version', '0.12', NOW())
                         ON CONFLICT (key) DO UPDATE
                         SET value = EXCLUDED.value, updated_at = NOW()
                         """
@@ -3386,35 +3388,37 @@ def main_inline_menu(role):
     ])
 
 def admin_inline_menu():
+    # v0.12: компактна адмінка — детальні функції сховані у тематичні підменю.
     return inline([
-        [
-            {"text":"🔐 Заявки","callback_data":"admin:requests"},
-            {"text":"👥 Учасники","callback_data":"admin:users"}
-        ],
-        [
-            {"text":"🎓 Результати","callback_data":"admin:results"},
-            {"text":"📊 Статистика","callback_data":"admin:stats"}
-        ],
-        [
-            {"text":"🚨 Події","callback_data":"admin:events"},
-            {"text":"⚠️ Недоліки","callback_data":"admin:defects"}
-        ],
-        [
-            {"text":"📞 SOS телефони","callback_data":"admin:sosphones"},
-            {"text":"🏢 Дільниці","callback_data":"admin:sites"}
-        ],
-        [
-            {"text":"📋 Рапорти","callback_data":"admin:reports"},
-            {"text":"🌾 Зерновий звіт","callback_data":"admin:grainreports"}
-        ],
-        [{"text":"🏆 Рейтинг","callback_data":"admin:rating"}],
-        [{"text":"🕒 Журнал змін","callback_data":"admin:shifts"}],
-        [
-            {"text":"📚 База знань","callback_data":"admin:knowledge"},
-            {"text":"📖 Процедура","callback_data":"menu:procedure"}
-        ],
-        [{"text":"👔 Керівництво","callback_data":"admin:leadership"}],
+        [{"text":"👥 Персонал","callback_data":"adminmenu:people"}, {"text":"📋 Звіти","callback_data":"adminmenu:reports"}],
+        [{"text":"🚨 Безпека","callback_data":"adminmenu:safety"}, {"text":"📚 Довідники","callback_data":"adminmenu:knowledge"}],
+        [{"text":"⚙️ Налаштування","callback_data":"adminmenu:settings"}],
     ])
+
+def admin_submenu(kind):
+    menus = {
+        "people": [
+            [{"text":"🔐 Заявки","callback_data":"admin:requests"},{"text":"👥 Учасники","callback_data":"admin:users"}],
+            [{"text":"🎓 Результати","callback_data":"admin:results"},{"text":"🏆 Рейтинг","callback_data":"admin:rating"}],
+        ],
+        "reports": [
+            [{"text":"📋 Рапорти змін","callback_data":"admin:reports"},{"text":"🕒 Журнал змін","callback_data":"admin:shifts"}],
+            [{"text":"🌾 Зерновий звіт","callback_data":"admin:grainreports"},{"text":"⚡ Генератори","callback_data":"admin:generators"}],
+            [{"text":"📊 Статистика","callback_data":"admin:stats"}],
+        ],
+        "safety": [
+            [{"text":"🚨 Події","callback_data":"admin:events"},{"text":"⚠️ Недоліки","callback_data":"admin:defects"}],
+            [{"text":"📞 SOS телефони","callback_data":"admin:sosphones"}],
+        ],
+        "knowledge": [
+            [{"text":"📚 База знань","callback_data":"admin:knowledge"},{"text":"📖 Процедура","callback_data":"menu:procedure"}],
+            [{"text":"👔 Керівництво","callback_data":"admin:leadership"}],
+        ],
+        "settings": [[{"text":"🏢 Дільниці","callback_data":"admin:sites"}]],
+    }
+    rows = list(menus.get(kind, []))
+    rows.append([{"text":"⬅️ Адмінка","callback_data":"home:admin"}])
+    return inline(rows)
 
 def back_home_menu(is_admin=False):
     return inline([[
@@ -3434,6 +3438,7 @@ def shift_menu():
             {"text":"⚠️ Недолік","callback_data":"shift:defect"}
         ],
         [{"text":"📋 Моє чергування","callback_data":"shift:current"}],
+        [{"text":"⚡ Робота бензогенератора","callback_data":"generator:start"}],
         [{"text":"⬅️ Назад","callback_data":"home:user"}],
     ])
 
@@ -4640,7 +4645,7 @@ def _parse_positive_number(text):
 def _format_tons(value):
     try:
         v = float(value)
-        return f"{v:,.3f}".replace(",", " ")
+        return f"{v:,.3f}".replace(",", " ").rstrip("0").rstrip(".")
     except Exception:
         return str(value or 0)
 
@@ -4728,12 +4733,78 @@ def _initial_shift_status(report_date, shift_type):
         return "finished"
     return "active"
 
+GENERATOR_OPTIONS = {"forte": "FORTE", "omline": "OMLine 6500E"}
+
+def _norm_person_name(value):
+    return " ".join((value or "").lower().replace("’", "'").split())
+
+def resolve_worker_tg_id(name, site=None):
+    """Повторно зв'язує ПІБ з Telegram ID, навіть якщо ID не потрапив у кнопку списку."""
+    if not name:
+        return None
+    direct = find_linked_tg_id(name, site)
+    if direct:
+        return direct
+    target = _norm_person_name(name)
+    data = load_data()
+    for key, user in data.get("users", {}).items():
+        if _norm_person_name(user.get("full_name")) == target and (not site or not user.get("site") or user.get("site") == site):
+            try: return int(user.get("telegram_id") or key)
+            except Exception: pass
+    for key, identity in data.get("profile_bindings", {}).items():
+        if _norm_person_name(identity.get("full_name")) == target and (not site or identity.get("site") == site):
+            try: return int(key)
+            except Exception: pass
+    return None
+
+def previous_shift_staff(data, site, current_report_date=None, current_shift_type=None):
+    rows = [r for r in data.get("shifts", {}).values() if r.get("site") == site]
+    rows.sort(key=lambda r: r.get("scheduled_start_at") or r.get("started_at") or r.get("report_created_at") or "", reverse=True)
+    for r in rows:
+        if current_report_date and r.get("report_date") == current_report_date and r.get("shift_type") == current_shift_type:
+            continue
+        return {"post1": (r.get("post1") or {}).get("name"), "post2": (r.get("post2") or {}).get("name"), "shift_id": r.get("id")}
+    return {}
+
+def generator_calendar_keyboard(year=None, month=None):
+    now = datetime.now(KYIV_TZ); year=int(year or now.year); month=int(month or now.month)
+    import calendar
+    names=["","Січень","Лютий","Березень","Квітень","Травень","Червень","Липень","Серпень","Вересень","Жовтень","Листопад","Грудень"]
+    rows=[[{"text":f"📅 {names[month]} {year}","callback_data":"noop"}], [{"text":d,"callback_data":"noop"} for d in ["Пн","Вт","Ср","Чт","Пт","Сб","Нд"]]]
+    for week in calendar.Calendar(firstweekday=0).monthdayscalendar(year,month):
+        rows.append([{"text":str(d) if d else "·","callback_data":f"gencal:{year}:{month}:{d}" if d else "noop"} for d in week])
+    pm=month-1 or 12; py=year-1 if month==1 else year; nm=month+1 if month<12 else 1; ny=year+1 if month==12 else year
+    rows.append([{"text":"◀️","callback_data":f"gencalnav:{py}:{pm}"},{"text":"❌ Скасувати","callback_data":"menu:shift"},{"text":"▶️","callback_data":f"gencalnav:{ny}:{nm}"}])
+    return inline(rows)
+
+def save_generator_report(tg_id, payload):
+    shift = get_active_shift(tg_id)
+    if not shift: return None
+    data=load_data(); rid=next_id(data,"next_generator_report_id")
+    row={"id":rid,"shift_id":shift.get("id"),"site":shift.get("site"),"telegram_id":tg_id,"generator":GENERATOR_OPTIONS.get(payload.get("generator"),payload.get("generator")),"work_date":payload.get("work_date"),"start_time":payload.get("start_time"),"end_time":payload.get("end_time"),"created_at":utc_now_iso()}
+    data.setdefault("generator_reports",{})[str(rid)]=row; save_data(data); return row
+
+def generator_report_text(row):
+    return (f"⚡ <b>РОБОТА БЕНЗОГЕНЕРАТОРА</b>\n\n🏢 Дільниця: <b>{escape(row.get('site') or '—')}</b>\n"
+            f"🔗 Зміна №<b>{row.get('shift_id')}</b>\n⚙️ Генератор: <b>{escape(row.get('generator') or '—')}</b>\n"
+            f"📅 Дата: <b>{escape(row.get('work_date') or '—')}</b>\n▶️ Початок: <b>{escape(row.get('start_time') or '—')}</b>\n⏹ Закінчення: <b>{escape(row.get('end_time') or '—')}</b>\n🆔 Запис №{row.get('id')}")
+
+def admin_generators_text():
+    rows=list(load_data().get("generator_reports",{}).values()); rows.sort(key=lambda r:(r.get("work_date") or "",r.get("start_time") or ""),reverse=True)
+    if not rows: return "⚡ <b>Робота бензогенераторів</b>\n\nЗаписів ще немає."
+    out=["⚡ <b>Робота бензогенераторів</b>",""]
+    for r in rows[:30]: out.append(f"📅 {escape(r.get('work_date') or '—')} · {escape(r.get('site') or '—')} · <b>{escape(r.get('generator') or '—')}</b> · {escape(r.get('start_time') or '—')}–{escape(r.get('end_time') or '—')} · зміна №{r.get('shift_id')}")
+    return "\n".join(out)
+
 def finalize_shift_report(tg_id, payload):
     site = payload.get("site") or (get_user(tg_id) or {}).get("site") or "—"
     report_date = payload.get("report_date")
     shift_type = payload.get("shift_type", "day")
     start, end, shift_label, hours = _shift_window(report_date, shift_type)
     data = load_data()
+    previous_staff = previous_shift_staff(data, site, report_date, shift_type)
+    payload["post1_tg_id"] = payload.get("post1_tg_id") or resolve_worker_tg_id(payload.get("post1_name"), site)
+    payload["post2_tg_id"] = payload.get("post2_tg_id") or resolve_worker_tg_id(payload.get("post2_name"), site)
     # Нова зміна тієї ж дільниці автоматично закриває попередній активний запис.
     for old in data.get("shifts", {}).values():
         if old.get("site") == site and old.get("status") == "active":
@@ -4758,6 +4829,7 @@ def finalize_shift_report(tg_id, payload):
         "post2": {"name": post2_name, "telegram_id": payload.get("post2_tg_id"), "role":"Охоронник-пожежник"} if post2_name else {},
         "patrol_post": 2 if post2_name else None,
         "master": payload.get("master"),
+        "previous_staff": previous_staff,
         "change_present": bool(payload.get("change_present")),
         "activities": list(payload.get("activities") or []),
         "remarks_present": bool(payload.get("remarks_present")),
@@ -4783,8 +4855,12 @@ def shift_report_text(row, admin_copy=False):
         f"🕒 Зміна: <b>{escape(row.get('shift_label') or '—')}</b>",
         f"⏰ Час: <b>{escape(row.get('shift_hours') or '—')}</b>",
         "",
-        f"1️⃣ Пост №1: {escape((row.get('post1') or {}).get('name') or '—')}",
+        "📤 <b>Зміну здали:</b>",
+        f"1️⃣ Пост №1: {escape((row.get('previous_staff') or {}).get('post1') or 'даних немає')}",
     ]
+    if (row.get("post2") or {}).get("name") or (row.get('previous_staff') or {}).get('post2'):
+        lines.append(f"2️⃣ Пост №2: {escape((row.get('previous_staff') or {}).get('post2') or 'даних немає')}")
+    lines += ["", "📥 <b>Зміну прийняли:</b>", f"1️⃣ Пост №1: {escape((row.get('post1') or {}).get('name') or '—')}"]
     if (row.get("post2") or {}).get("name"):
         lines.append(f"2️⃣ Пост №2: {escape((row.get('post2') or {}).get('name') or '—')}")
     lines += [
@@ -5377,6 +5453,39 @@ def handle_callback(cq):
             admin_inline_menu()
         )
         return
+
+    if data_cb.startswith("adminmenu:"):
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав"); return
+        kind=data_cb.split(":",1)[1]; answer_callback(cq["id"])
+        edit_message(tg_id,cq["message"]["message_id"],"🛡 <b>Адміністративна панель</b>\n\nОбери потрібну функцію:",admin_submenu(kind)); return
+
+    if data_cb == "admin:generators":
+        if tg_id != ADMIN_ID:
+            answer_callback(cq["id"], "Недостатньо прав"); return
+        answer_callback(cq["id"]); edit_message(tg_id,cq["message"]["message_id"],admin_generators_text(),inline([[{"text":"⬅️ Звіти","callback_data":"adminmenu:reports"}]])); return
+
+    if data_cb == "generator:start":
+        shift=get_active_shift(tg_id)
+        if not shift:
+            answer_callback(cq["id"],"Спочатку потрібно заступити на зміну"); return
+        set_state(tg_id,"generator_type",{"shift_id":shift.get("id")}); answer_callback(cq["id"])
+        edit_message(tg_id,cq["message"]["message_id"],"⚡ <b>Робота бензогенератора</b>\n\nОбери генератор:",inline([[{"text":"FORTE","callback_data":"generator:type:forte"},{"text":"OMLine 6500E","callback_data":"generator:type:omline"}],[{"text":"❌ Скасувати","callback_data":"menu:shift"}]])); return
+
+    if data_cb.startswith("generator:type:"):
+        state,payload=get_state(tg_id)
+        if state != "generator_type": answer_callback(cq["id"],"Почни оформлення заново"); return
+        payload["generator"]=data_cb.rsplit(":",1)[1]; set_state(tg_id,"generator_date",payload); now=datetime.now(KYIV_TZ); answer_callback(cq["id"])
+        edit_message(tg_id,cq["message"]["message_id"],"⚡ <b>Робота бензогенератора</b>\n\nОбери дату роботи:",generator_calendar_keyboard(now.year,now.month)); return
+
+    if data_cb.startswith("gencalnav:"):
+        _,ys,ms=data_cb.split(":"); answer_callback(cq["id"]); edit_message(tg_id,cq["message"]["message_id"],"⚡ <b>Робота бензогенератора</b>\n\nОбери дату роботи:",generator_calendar_keyboard(int(ys),int(ms))); return
+
+    if data_cb.startswith("gencal:"):
+        _,ys,ms,ds=data_cb.split(":"); state,payload=get_state(tg_id)
+        if state != "generator_date": answer_callback(cq["id"],"Почни оформлення заново"); return
+        payload["work_date"]=f"{int(ys):04d}-{int(ms):02d}-{int(ds):02d}"; set_state(tg_id,"generator_start_time",payload); answer_callback(cq["id"])
+        edit_message(tg_id,cq["message"]["message_id"],"▶️ Введи <b>час початку</b> роботи у форматі <code>HH:MM</code>, наприклад <code>09:15</code>:",inline([[{"text":"❌ Скасувати","callback_data":"menu:shift"}]])); return
 
     if data_cb == "menu:shift":
         answer_callback(cq["id"])
@@ -6795,6 +6904,19 @@ def handle_text(msg):
         )
         return
 
+    if state == "generator_start_time":
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
+            send_message(tg_id,"Введи час у форматі <code>HH:MM</code>, наприклад <code>09:15</code>."); return
+        payload["start_time"]=text; set_state(tg_id,"generator_end_time",payload)
+        send_message(tg_id,"⏹ Введи <b>час закінчення</b> роботи у форматі <code>HH:MM</code>, наприклад <code>12:40</code>:"); return
+
+    if state == "generator_end_time":
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
+            send_message(tg_id,"Введи час у форматі <code>HH:MM</code>, наприклад <code>12:40</code>."); return
+        payload["end_time"]=text; row=save_generator_report(tg_id,payload); clear_state(tg_id)
+        if not row: send_message(tg_id,"⚠️ Активну зміну не знайдено. Спочатку заступи на зміну.",shift_menu()); return
+        send_message(tg_id,"✅ Запис збережено.\n\n"+generator_report_text(row),shift_menu()); send_message(ADMIN_ID,"📨 <b>Новий запис генератора</b>\n\n"+generator_report_text(row)); return
+
     # ---------- OBJECT SEARCH ----------
     if state == "object_search":
         results = search_objects(text)
@@ -6917,8 +7039,6 @@ def handle_text(msg):
         clear_state(tg_id)
         send_message(tg_id, "✅ <b>Зміну розпочато. Рапорт збережено.</b>\n\n" + shift_report_text(row), shift_menu())
         send_message(ADMIN_ID, "📨 <b>Новий рапорт зміни</b>\n\n" + shift_report_text(row, admin_copy=True))
-        if (row.get("post2") or {}).get("name") and not (row.get("post2") or {}).get("telegram_id"):
-            send_message(ADMIN_ID, "⚠️ Пост №2 у цьому рапорті не має прив’язаного Telegram ID; автоматичні нагадування про патрулювання не надійдуть напряму працівнику.")
         return
 
     # ---------- ADMIN: SOS PHONE CONTACTS ----------
@@ -7116,7 +7236,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "security_guard_bot",
-        "version": "0.11",
+        "version": "0.12",
         "storage": "postgresql_guard_app_state",
         "database_configured": bool(DATABASE_URL),
         "training_questions_bank": len(QUESTION_BANK),
@@ -7214,7 +7334,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
 
     log.info(
-        "Starting Security Guard Bot v0.10 on port %s",
+        "Starting Security Guard Bot v0.12 on port %s",
         port
     )
 
